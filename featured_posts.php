@@ -6,14 +6,23 @@ Author: SalesCrunch, Inc.
 Version: 0.0.1
 Author URI: http://www.salescrunch.com
 */
-error_reporting(E_ALL);
-ini_set('display_errors', true);
 
 class FeaturedPostPlugin
 {
-  public static $FEATURED_POST_CATEGORY = 'Featured';
-  public static $DEFAULT_NUM_POSTS = 2;
+  public static $FEATURED_POST_CATEGORY      = 'Featured';
+  public static $DEFAULT_NUM_POSTS           = 2;
+  public static $DEFAULT_FEED_URL            = 'http://blog.salescrunch.com/featured/feed/';
+  public static $CATEGORY_PERMALINK_TEMPLATE = 'http://blog.salescrunch.com/%s/';
+  public static $HTTP_SUCCESS                = 200;
+  public static $MAX_NUM_CATEGORY_LINKS      = 2;
+
+  private static $_timeout    = 10;
+  private static $_user_agent = "SalesCrunch Featured Posts Plugin Fetcher";
   
+  private $_status = ''; 
+
+  protected $num_posts, $url, $xml, $parsed;
+
   public function __construct()
   {
     add_action('init', array(&$this, "register_post_type"));
@@ -36,75 +45,151 @@ class FeaturedPostPlugin
                        ));
   }
 
+  function fetch_xml()
+  {
+    $this->xml = "";
+
+    $s = curl_init();
+    curl_setopt($s,CURLOPT_URL,$this->url);
+    curl_setopt($s,CURLOPT_TIMEOUT, FeaturedPostPlugin::$_timeout);
+    curl_setopt($s,CURLOPT_RETURNTRANSFER, true);
+    curl_setopt($s,CURLOPT_FOLLOWLOCATION, true);
+    curl_setopt($s,CURLOPT_USERAGENT, FeaturedPostPlugin::$_user_agent);
+    $this->xml = curl_exec($s);
+    $this->_status = curl_getinfo($s, CURLINFO_HTTP_CODE);
+    if ($this->_status != FeaturedPostPlugin::$HTTP_SUCCESS) 
+    {
+      $this->xml = "";
+    } 
+    return $this->xml;
+  }
+
+  function fetch() 
+  {
+    // will hold the structured data parsed out of the RSS feed
+    $this->parsed = array();
+
+    // fetch the feed
+    $this->fetch_xml();
+    if ($this->xml == '')
+    {
+      return $this->parsed;
+    }
+
+    // parse it
+    $doc = new DOMDocument();
+    $doc->loadXML($this->xml);
+    $items = $doc->getElementsByTagName('item');
+    if (empty($items)) 
+    {
+      return array();
+    }
+    $fetched = 0;
+    $data = array();
+    foreach($items as $item) 
+    {
+      $valid = $item->getElementsByTagName('title') && $item->getElementsByTagName('creator') && $item->getElementsByTagName('link') && $item->getElementsByTagName('pubDate');
+      if (!$valid) 
+      {
+        continue;
+      }
+      $data = array(
+        'title'      => $item->getElementsByTagName('title')->item(0)->nodeValue,
+        'author'     => $item->getElementsByTagName('creator')->item(0)->nodeValue,
+        'permalink'  => $item->getElementsByTagName('link')->item(0)->nodeValue,
+        'date'       => date("M j, Y", strtotime($item->getElementsByTagName('pubDate')->item(0)->nodeValue)),
+        'categories' => array()
+      );
+      if ($item->getElementsByTagName('category'))
+      { 
+        $cat_ct = 0;
+        foreach($item->getElementsByTagName('category') as $node) 
+        {
+          $data['categories'][] = $node->nodeValue;
+          if (++$cat_cat >= FeaturedPostPlugin::$MAX_NUM_CATEGORY_LINKS)
+          {
+            break;
+          }
+        }
+      }
+      $this->parsed[] = $data;
+      
+      if (++$fetched >= $this->num_posts) 
+      {
+        break;
+      }
+    }
+    return $this->parsed;
+  }
+
   function shortcode($atts, $content = null, $code = "")
   {
-    global $post, $wp_query;
+    $this->url = isset($atts['url']) ? $atts['url'] : FeaturedPostPlugin::$DEFAULT_FEED_URL;
+    $this->num_posts = isset($atts['numposts']) ? $atts['numposts'] : FeaturedPostPlugin::$DEFAULT_NUM_POSTS;
+    
+    $my_posts = $this->fetch();
 
     $retval = "";
-
-    $my_posts = get_posts(array(
-    'numberposts'     => isset($atts['numposts']) ? $atts['numposts'] : FeaturedPostPlugin::$DEFAULT_NUM_POSTS,
-    'category'        => isset($atts['category']) ? $atts['category'] : FeaturedPostPlugin::$FEATURED_POST_CATEGORY,
-    'orderby'         => 'post_date',
-    'order'           => 'DESC',
-    'post_type'       => 'post',
-    'post_status'     => 'publish')
-    );
+    $num_posts = count($my_posts);
     
-    if (empty($my_posts)) 
+    if ($num_posts == 0)
     {
       $retval = "<p>No featured posts.</p>";
     }
     else
     {
+      $divider = $this->render_divider();
+      
+      $ct = 0;
       foreach($my_posts as $my_post)
       {
-        setup_postdata($my_post);
         $retval .= $this->render($my_post);
+        if (++$ct < $num_posts) 
+        {
+          $retval .= $divider;
+        }
       }
     }
-    
-    wp_reset_query();
+    return $retval;
+  }
+
+  function render_divider()
+  {
+    ob_start();
+    require('views/divider.php');
+    $retval = ob_get_contents();
+    ob_end_clean();
 
     return $retval;
+  }
+
+  function render_category_links($categories) 
+  {
+    $links = array();
+    foreach($categories as $category)
+    {
+      $links[] = sprintf(
+        '<a href="%s">%s</a>', 
+        sprintf(FeaturedPostPlugin::$CATEGORY_PERMALINK_TEMPLATE, self::mangle_category_name($category)), 
+        $category
+      );
+   }
+   return implode(', ', $links);
+  }
+
+  private static function mangle_category_name($cat)
+  {
+    return str_replace(' ', '-', trim(strtolower($cat)));
   }
 
   function render($post)
   {
     ob_start();
-    extract(array('post' => $post));
+    extract(array('post' => $post, 'category_links' => $this->render_category_links($post['categories'])));
     require('views/post.php');
     $retval = ob_get_contents();
     ob_end_clean();
-
     return $retval;
-
-  }
-
-  public function get_attachments($post, $targetId)
-  {
-    $args = array(
-      'post_type' => 'attachment',
-      'numberposts' => 1,
-      'post_status' => null,
-      'post_parent' => $post->ID
-    );
-
-    $attachments = get_posts( $args );
-
-    if($attachments) 
-    {
-      $imageInfo = wp_get_attachment_image_src($attachments[0]->ID, 'full');
-      $attachmentImage = $imageInfo[0];
-    } 
-    else 
-    {
-      $attachmentImage = "https://www.google.com/intl/en_com/images/srpr/logo3w.png";
-    }
-
-    $attachments = array('postId' => $targetId, 'postImage' => $attachmentImage);
-
-    return $attachments;
   }
 
   public function setup_assets() 
